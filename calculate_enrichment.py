@@ -132,18 +132,30 @@ GC_CTRL_RESOLUTION = args.GC_bp_resolution
 GC_MAX = args.GC_max
 GC_MIN = args.GC_min
 
-# calculate the number of threads
+# calculate the number of worker processes
 if args.num_threads:
-    if args.num_threads >= 40:
-        print("Capping the thread count at 40.")
-        num_threads = 40
-    else:
-        num_threads = args.num_threads
+    num_threads = args.num_threads
+    print(f"Using user-specified --num_threads={num_threads}.")
 else:
-    num_threads = int(os.getenv('SLURM_CPUS_PER_TASK', 1))
+    num_threads = detectAssignedCPUs()
 
-# if running on slurm, set tmp to runtime dir
-set_tempdir(os.getenv('ACCRE_RUNTIME_DIR', get_tempdir()))
+# Keep original safety cap
+MAX_WORKERS = 100
+
+if num_threads > MAX_WORKERS:
+    print(f"Capping worker count at {MAX_WORKERS}.")
+    num_threads = MAX_WORKERS
+
+# No benefit to more workers than iterations
+if num_threads > ITERATIONS:
+    print(f"Reducing worker count to match number of iterations: {ITERATIONS}.")
+    num_threads = ITERATIONS
+
+if num_threads < 1:
+    print("Warning: detected worker count was less than 1. Using 1 worker.")
+    num_threads = 1
+
+print(f"Using {num_threads} parallel worker processes.")
 
 
 ###
@@ -377,6 +389,61 @@ def calculateEmpiricalP(obs, exp_sum_list):
 
     return "%d\t%.3f\t%.3f\t%.3f\t%.3f" % (obs, mu, sigma, fold_change, p_val)
 
+#
+# detectAssignedCPUs
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function detects the number of CPU slots assigned to the
+#       current job by common HPC schedulers. The returned value is used
+#       to set the number of multiprocessing worker processes.
+#
+#       The function checks PBS Pro, PBS/Torque, SGE/UGE, and SLURM
+#       environment variables. If no scheduler variable is found, it
+#       checks Linux CPU affinity. If that is unavailable, it falls back
+#       to os.cpu_count().
+#
+# input:
+#       None
+#
+# output:
+#       return: number of logical CPU slots available to the current job
+#
+def detectAssignedCPUs():
+    scheduler_vars = [
+        "NCPUS",                # PBS Pro
+        "PBS_NP",              # PBS/Torque
+        "NSLOTS",              # SGE/UGE qsub
+        "SLURM_CPUS_PER_TASK", # SLURM
+        "SLURM_CPUS_ON_NODE",  # SLURM fallback
+    ]
+
+    for var in scheduler_vars:
+        value = os.getenv(var)
+
+        if value:
+            try:
+                n = int(value)
+
+                if n > 0:
+                    print(f"Detected {n} CPU slots from ${var}.")
+                    return n
+
+            except ValueError:
+                print(f"Warning: could not parse ${var}={value} as an integer.")
+
+    if hasattr(os, "sched_getaffinity"):
+        n = len(os.sched_getaffinity(0))
+
+        if n > 0:
+            print(f"Detected {n} CPU slots from CPU affinity.")
+            return n
+
+    n = os.cpu_count() or 1
+    print(f"No scheduler CPU variable found; falling back to os.cpu_count()={n}.")
+
+    return n
 
 ###
 #   main
@@ -432,14 +499,27 @@ def main(argv):
         blackList_file_name = BLACKLIST
 
     print("running calculateExpected_with_GC")
-    pool = Pool(num_threads)
-    partial_calcExp = partial(calculateExpected_with_GC, BedTool(ANNOTATION_FILENAME), BedTool(TEST_FILENAME), ELEMENT, HAPBLOCK, SPECIES, blackList_file_name)
-    exp_sum_list = pool.map(partial_calcExp, [i for i in range(ITERATIONS)])
+
+    partial_calcExp = partial(
+        calculateExpected_with_GC,
+        BedTool(ANNOTATION_FILENAME),
+        BedTool(TEST_FILENAME),
+        ELEMENT,
+        HAPBLOCK,
+        SPECIES,
+        blackList_file_name
+    )
+
+    chunksize = max(1, ITERATIONS // (num_threads * 4))
+
+    with Pool(processes=num_threads) as pool:
+        exp_sum_list = pool.map(
+            partial_calcExp,
+            range(ITERATIONS),
+            chunksize=chunksize
+        )
 
     print("Finish calculateExpected_with_GC")
-    # wait for results to finish before calculating p-value
-    pool.close()
-    pool.join()
 
     # remove iterations that throw bedtools exceptions
     final_exp_sum_list = [x for x in exp_sum_list if x >= 0]
