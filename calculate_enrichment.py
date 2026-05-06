@@ -513,11 +513,11 @@ def main(argv):
     chunksize = max(1, ITERATIONS // (num_threads * 4))
 
     with Pool(processes=num_threads) as pool:
-        exp_sum_list = pool.map(
+        exp_sum_list = list(pool.imap_unordered(
             partial_calcExp,
             range(ITERATIONS),
             chunksize=chunksize
-        )
+        ))
 
     print("Finish calculateExpected_with_GC")
 
