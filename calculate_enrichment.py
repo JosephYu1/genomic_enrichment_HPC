@@ -28,6 +28,7 @@
 import csv
 import os
 import sys, traceback
+import gzip
 import argparse
 import datetime
 import math
@@ -78,6 +79,34 @@ arg_parser.add_argument("--GC_max", type=int, default=None,
 
 arg_parser.add_argument("--GC_min", type=int, default=None,
                         help="custom min GC percent threshold (integer, ex: 20) for GC option, must be used with --GC_max, default is --GC_margin default settings")
+
+arg_parser.add_argument(
+    "--GC_window_cache",
+    type=str,
+    default=None,
+    help=(
+        "Optional precomputed compressed genome GC window cache. "
+        "Expected tab-delimited columns: chrom, start, end, gc_fraction. "
+        "Example row: chr1\\t0\\t100\\t0.420000. "
+        "If not provided, the script looks in the script directory for a matching "
+        "*.bed.gz cache based on species and --GC_bp_resolution. If none exists, "
+        "it creates one automatically."
+    )
+)
+
+arg_parser.add_argument(
+    "--GC_whitelist_cache",
+    type=str,
+    default=None,
+    help=(
+        "Optional precomputed final GC-compatible whitelist BED file used by "
+        "bedtools shuffle with incl=. Expected tab-delimited columns: chrom, start, end. "
+        "Example row: chr1\\t10000\\t25000. "
+        "If not provided, the script looks in the script directory for a matching "
+        "*.bed file based on species, --GC_bp_resolution, GC range, and blacklist. "
+        "If none exists, it creates one automatically."
+    )
+)
 
 #
 # restricted_float
@@ -131,6 +160,8 @@ GC_CTRL_RANGE = args.GC_margin
 GC_CTRL_RESOLUTION = args.GC_bp_resolution
 GC_MAX = args.GC_max
 GC_MIN = args.GC_min
+GC_WINDOW_CACHE = args.GC_window_cache
+GC_WHITELIST_CACHE = args.GC_whitelist_cache
 
 # calculate the number of threads
 if args.num_threads:
@@ -213,56 +244,290 @@ def calculateObserved(annotation, test, elementwise, hapblock):
 
 
 #
+# get_script_dir
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function returns the directory containing this script.
+#
+# input:
+#       None
+#
+# output:
+#       return: absolute path to the script directory
+#
+def get_script_dir():
+    """
+    Return the directory where this script lives.
+    """
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+#
+# open_maybe_gzip
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function opens either a plain text file or gzip-compressed
+#       text file. Files ending in ".gz" are opened with gzip.open,
+#       otherwise they are opened with the regular open function.
+#
+# input:
+#       filename: path to the file to open
+#       mode:     file open mode; default="rt"
+#
+# output:
+#       return: open file handle
+#
+def open_maybe_gzip(filename, mode="rt"):
+    """
+    Open plain text or gzip-compressed files.
+    """
+    if filename.endswith(".gz"):
+        return gzip.open(filename, mode)
+    return open(filename, mode)
+
+
+#
+# safe_basename
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function extracts the base filename from a path and removes
+#       common BED file extensions. The returned string is used when
+#       constructing cache filenames.
+#
+# input:
+#       path: path to a file
+#
+# output:
+#       return: simplified filename string safe for cache naming
+#
+def safe_basename(path):
+    """
+    Convert a path into a safe short basename for cache filenames.
+    """
+    if path is None:
+        return "none"
+
+    base = os.path.basename(path)
+    return (
+        base
+        .replace(".bed.gz", "")
+        .replace(".bed", "")
+        .replace("/", "_")
+        .replace(" ", "_")
+    )
+
+
+#
+# get_auto_gc_window_cache_path
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function constructs the default filepath for the compressed
+#       genome GC window cache. This cache stores all genome windows and
+#       their GC content for a specific species and GC window resolution.
+#
+#       The output file is stored in the same directory as this script.
+#
+# input:
+#       species:       genome build/species string
+#       GC_resolution: window size used for GC calculation
+#
+# output:
+#       return: default filepath for the genome GC window cache
+#
+def get_auto_gc_window_cache_path(species, GC_resolution):
+    """
+    Cache for all genome windows and their GC content.
+    Depends only on species and GC window/step size.
+    """
+    step_size = math.trunc(GC_resolution / 2)
+
+    filename = (
+        f"{species}_genome_gc_windows_"
+        f"w{GC_resolution}_s{step_size}.bed.gz"
+    )
+
+    return os.path.join(get_script_dir(), filename)
+
+
+#
+# get_auto_gc_whitelist_cache_path
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function constructs the default filepath for the final
+#       GC-compatible whitelist BED file. This whitelist stores genome
+#       regions that pass the GC content filter and have regular
+#       blacklist/gap regions removed.
+#
+#       This file is used as the include file for bedtools shuffle when
+#       the GC option is enabled.
+#
+# input:
+#       species:             genome build/species string
+#       GC_resolution:       window size used for GC calculation
+#       lowerGC:             lower GC content cutoff
+#       upperGC:             upper GC content cutoff
+#       blacklist_file_name: regular blacklist/gap BED file subtracted
+#                            from the GC-compatible regions
+#
+# output:
+#       return: default filepath for the final GC-compatible whitelist BED
+#
+def get_auto_gc_whitelist_cache_path(
+    species,
+    GC_resolution,
+    lowerGC,
+    upperGC,
+    blacklist_file_name
+):
+    """
+    Cache for the final filtered whitelist BED file.
+    """
+    step_size = math.trunc(GC_resolution / 2)
+    blacklist_label = safe_basename(blacklist_file_name)
+
+    filename = (
+        f"{species}_gc_whitelist_"
+        f"w{GC_resolution}_s{step_size}_"
+        f"gc{lowerGC:.6f}-{upperGC:.6f}_"
+        f"excl_{blacklist_label}.bed"
+    )
+
+    return os.path.join(get_script_dir(), filename)
+
+
+#
+# resolve_cache_path
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function determines whether to use an explicitly supplied
+#       cache file or an automatically generated cache path.
+#
+#       If the explicit path is supplied, the function checks that the
+#       file exists and returns it. If no explicit path is supplied, the
+#       function checks whether the automatic cache file exists. If it
+#       exists, the file is reused. If it does not exist, the automatic
+#       path is returned as the location where the cache should be
+#       created.
+#
+# input:
+#       explicit_path: user-supplied cache filepath, or None
+#       auto_path:     automatically generated cache filepath
+#       description:   text description of the cache type for printed
+#                      status messages
+#
+# output:
+#       return: tuple of cache filepath and boolean indicating whether
+#               that cache already exists
+#
+def resolve_cache_path(explicit_path, auto_path, description):
+    """
+    Decide whether to use an explicit cache or an automatic cache path.
+    """
+    if explicit_path is not None:
+        if not os.path.exists(explicit_path):
+            print(f"Error: explicitly supplied {description} does not exist: {explicit_path}")
+            sys.exit(1)
+
+        print(f"Using explicitly supplied {description}: {explicit_path}")
+        return explicit_path, True
+
+    if os.path.exists(auto_path):
+        print(f"Found existing automatic {description}: {auto_path}")
+        return auto_path, True
+
+    print(f"No existing automatic {description} found.")
+    print(f"Will create new {description}: {auto_path}")
+    return auto_path, False
+
+#
 # caclulateGCBlackListRegion
 #
 # updated | 2021.7.20
+#           2026.05.06
 #
 # Description:
-#       This function caclulates the whitelist regions from the GC content
+#       This function calculates the whitelist regions from the GC content
 #       restrictions.
 #
+#       This updated version supports caching two files:
+#
+#       1. A compressed genome GC window cache. This file stores genome
+#          windows and their GC content for a specified species and
+#          GC resolution.
+#
+#          Example row:
+#              chr1    0    100    0.420000
+#
+#       2. A final GC-compatible whitelist BED file. This file stores
+#          merged genome regions that pass the GC content filter after
+#          subtracting regular blacklist/gap regions. This file is used
+#          as the include file for bedtools shuffle.
+#
+#          Example row:
+#              chr1    10000    25000
+#
+#       If the cache files already exist, they are reused. If they do
+#       not exist and no explicit cache file is supplied, the function
+#       creates them in the same directory as this script.
+#
 # input:
-#       species:        The species that the bed files belong to
-#       GC_resolution:  The window size for the GC content calculation
-#       GC_range:       The range of tolerance for the GC content to vary (decimals)
-#       annotation:     bedtool object that contains the bed file regions
+#       species:              The species/genome build used
+#       GC_resolution:        The window size for the GC content calculation
+#       GC_range:             The range of tolerance for GC content to vary
+#                             from the annotation median
+#       annotation:           BEDTOOL object containing the annotation regions
+#       blacklist_file_name:  BED file containing blacklist/gap regions to
+#                             subtract from the GC-compatible regions
+#       GC_window_cache:      Optional user-supplied compressed genome GC
+#                             window cache file
+#       GC_whitelist_cache:   Optional user-supplied final GC-compatible
+#                             whitelist BED file
 #
 # output:
-#       returns the calculated whitelist regions and list of GC content
-#       calculations
+#       return: GC-compatible whitelist BEDTOOL object, numpy array of
+#               annotation GC content values, and filepath to the final
+#               GC-compatible whitelist BED file
 #
-def calculateGC_blackListRegion(species, GC_resolution, GC_range, annotation):
+def calculateGC_blackListRegion(
+    species,
+    GC_resolution,
+    GC_range,
+    annotation,
+    blacklist_file_name,
+    GC_window_cache=None,
+    GC_whitelist_cache=None
+):
     print("running calculateGC_blackListRegion")
-    genomeSizeFile = {'hg19' : './genomeGC/hg19_manual.txt',
-                      'hg38' : './genomeGC/hg38_manual.txt',
-                      'mm10' : './genomeGC/mm10_manual.txt',
-                      'dm3'  : './genomeGC/dm3_manual.txt'
-                      }[species]
 
-    # Splitting genome into specified bp windows (overlapping, coverageOverlap)
-    print("running window maker")
-    splitBed = BedTool()
-    coverageOverlap = math.trunc(GC_resolution / 2)
-    splitGenome = splitBed.window_maker(g=genomeSizeFile, w=int(GC_resolution), s=coverageOverlap)
+    genomeSizeFile = {
+        'hg19' : './genomeGC/hg19_manual.txt',
+        'hg38' : './genomeGC/hg38_manual.txt',
+        'mm10' : './genomeGC/mm10_manual.txt',
+        'dm3'  : './genomeGC/dm3_manual.txt'
+    }[species]
 
-    # calculating GC content for each window
-    print("running GC content calculation")
-    genomeFasta = {'hg19' : './genomeFASTA/hg19.fa',
-                   'hg38' : './genomeFASTA/hg38.fa',
-                   'mm10' : './genomeFASTA/mm10.fa',
-                   'dm3'  : './genomeFASTA/dm3.fa'
-                   }[species]
-    genomeGC_result = splitGenome.nucleotide_content(fi=genomeFasta)
+    genomeFasta = {
+        'hg19' : './genomeFASTA/hg19.fa',
+        'hg38' : './genomeFASTA/hg38.fa',
+        'mm10' : './genomeFASTA/mm10.fa',
+        'dm3'  : './genomeFASTA/dm3.fa'
+    }[species]
 
-    # calculating GC content for entry in annotation bed file
+    print("running annotation GC content calculation")
     annotationGC_result = annotation.nucleotide_content(fi=genomeFasta)
 
-    # calculating GC content summary stats for annotation bed files
-    print("ending GC content calculation")
-
-    # calculating the median and extracting the GC content from
-    # nucleotide_content function (see pybedtools for return format, watch out
-    # for custom columns from BED files)
     annotationGC = []
     for entry in annotationGC_result:
         annotationGC.append(float(entry[-8]))
@@ -270,7 +535,6 @@ def calculateGC_blackListRegion(species, GC_resolution, GC_range, annotation):
     np_annotationGC = np.array(annotationGC)
     median = np.median(np_annotationGC)
 
-    # finding regions in genome windows that fail to reach requirements
     if GC_MAX is not None and GC_MIN is not None:
         upperGC = GC_MAX
         lowerGC = GC_MIN
@@ -279,19 +543,118 @@ def calculateGC_blackListRegion(species, GC_resolution, GC_range, annotation):
         upperGC = median * (1 + GC_range)
         lowerGC = median * (1 - GC_range)
 
-    GC_whitelist = []
-    for window in genomeGC_result:
-        if float(window[-8]) >= float(lowerGC) and float(window[-8]) <= float(upperGC):
-            entry = []
-            entry.append(window[0])
-            entry.append(window[1])
-            entry.append(window[2])
+    print(f"Annotation median GC: {median}")
+    print(f"Allowed GC range: {lowerGC} to {upperGC}")
 
-            GC_whitelist.append(entry)
+    auto_window_cache = get_auto_gc_window_cache_path(
+        species,
+        GC_resolution
+    )
 
-    genomeGC_whitelist_Object = BedTool(GC_whitelist).sort().merge()
+    window_cache_path, window_cache_exists = resolve_cache_path(
+        explicit_path=GC_window_cache,
+        auto_path=auto_window_cache,
+        description="GC window cache"
+    )
 
-    return genomeGC_whitelist_Object, np_annotationGC
+    auto_whitelist_cache = get_auto_gc_whitelist_cache_path(
+        species=species,
+        GC_resolution=GC_resolution,
+        lowerGC=lowerGC,
+        upperGC=upperGC,
+        blacklist_file_name=blacklist_file_name
+    )
+
+    whitelist_cache_path, whitelist_cache_exists = resolve_cache_path(
+        explicit_path=GC_whitelist_cache,
+        auto_path=auto_whitelist_cache,
+        description="GC whitelist cache"
+    )
+
+    if whitelist_cache_exists:
+        print(f"Using existing final GC whitelist BED: {whitelist_cache_path}")
+        genomeGC_whitelist_Object = BedTool(whitelist_cache_path)
+        return genomeGC_whitelist_Object, np_annotationGC, whitelist_cache_path
+
+    print(f"Creating final GC whitelist BED: {whitelist_cache_path}")
+
+    raw_whitelist_path = whitelist_cache_path + ".raw_unmerged"
+
+    with open(raw_whitelist_path, "w") as raw_whitelist:
+
+        if window_cache_exists:
+            print(f"Reading genome GC windows from cache: {window_cache_path}")
+
+            with open_maybe_gzip(window_cache_path, "rt") as cache_file:
+                for line in cache_file:
+                    if not line.strip() or line.startswith("#"):
+                        continue
+
+                    fields = line.rstrip("\n").split("\t")
+
+                    if len(fields) < 4:
+                        continue
+
+                    chrom = fields[0]
+                    start = fields[1]
+                    end = fields[2]
+                    gc = float(fields[3])
+
+                    if lowerGC <= gc <= upperGC:
+                        raw_whitelist.write(f"{chrom}\t{start}\t{end}\n")
+
+        else:
+            print("Creating genome windows")
+            splitBed = BedTool()
+            coverageOverlap = math.trunc(GC_resolution / 2)
+
+            splitGenome = splitBed.window_maker(
+                g=genomeSizeFile,
+                w=int(GC_resolution),
+                s=coverageOverlap
+            )
+
+            print("Calculating genome-wide GC content")
+            genomeGC_result = splitGenome.nucleotide_content(fi=genomeFasta)
+
+            print(f"Writing compressed genome GC window cache: {window_cache_path}")
+
+            with gzip.open(window_cache_path, "wt") as window_cache_file:
+                window_cache_file.write("#chrom\tstart\tend\tgc_fraction\n")
+
+                for window in genomeGC_result:
+                    chrom = window[0]
+                    start = window[1]
+                    end = window[2]
+                    gc = float(window[-8])
+
+                    window_cache_file.write(
+                        f"{chrom}\t{start}\t{end}\t{gc:.6f}\n"
+                    )
+
+                    if lowerGC <= gc <= upperGC:
+                        raw_whitelist.write(f"{chrom}\t{start}\t{end}\n")
+
+    print("Sorting and merging GC-compatible regions")
+
+    merged_gc_regions = BedTool(raw_whitelist_path).sort().merge()
+
+    print(f"Subtracting blacklist regions: {blacklist_file_name}")
+
+    bedFile = BedTool(blacklist_file_name)
+
+    merged_gc_regions.subtract(bedFile).sort().merge().saveas(
+        whitelist_cache_path
+    )
+
+    if os.path.exists(raw_whitelist_path):
+        os.remove(raw_whitelist_path)
+
+    print(f"Saved final GC whitelist BED: {whitelist_cache_path}")
+
+    genomeGC_whitelist_Object = BedTool(whitelist_cache_path)
+
+    return genomeGC_whitelist_Object, np_annotationGC, whitelist_cache_path
 
 #
 # caclulateExpected_with_GC
@@ -401,32 +764,23 @@ def main(argv):
     BLACKLIST = loadConstants(SPECIES, CUSTOM_BLIST)
 
     if GC_CTRL_OPT:
-        bedFile = BedTool(BLACKLIST)
 
-        # Is custom GC whitelist provided
-        if GC_BLACKLIST is None:
-            GC_blacklist, np_annotationGC = calculateGC_blackListRegion(SPECIES, GC_CTRL_RESOLUTION, GC_CTRL_RANGE, BedTool(ANNOTATION_FILENAME))
+    # If the user provides the older --GC_blacklist argument,
+    # treat it as the final GC-compatible whitelist file.
+    if GC_BLACKLIST is not None:
+        blackList_file_name = GC_BLACKLIST
+        print(f"Using GC whitelist from --GC_blacklist: {blackList_file_name}")
 
-            # extracting file names from path to construct unique black list file name using sys time
-            firstFilePath = ANNOTATION_FILENAME.split("/")
-            secondFilePath = TEST_FILENAME.split("/")
-            firstFile = firstFilePath[len(firstFilePath) - 1]
-            secondFile = secondFilePath[len(secondFilePath) - 1]
-            blackList_file_name = '{file1}s_{file2}.bed'.format(file1 = firstFile, file2 = secondFile)
-            blackList_file_name = blackList_file_name + '{date:%Y-%m-%d_%H:%M:%S}.bed'.format(date = datetime.datetime.now())
-
-            # subtracting regions that are blacklisted from the whitelist
-            whitelist = GC_blacklist.subtract(bedFile).sort().merge().saveas(blackList_file_name)
-            # whitelist = GC_blacklist.subtract(bedFile).sort().merge().complement(genome='hg19').saveas(blackList_file_name)
-
-            # blackList = GC_blacklist.cat(bedFile).saveas(blackList_file_name)
-
-        else:
-            blackList_file_name = GC_BLACKLIST
-
-        # Bedtools cat function auto merges after cat operation
-        #print("Merging blacklist files and storing as " +  blackList_file_name)
-        #merged_blackList = bedFile.cat(GC_blacklist).saveas(blackList_file_name)
+    else:
+        GC_blacklist, np_annotationGC, blackList_file_name = calculateGC_blackListRegion(
+            SPECIES,
+            GC_CTRL_RESOLUTION,
+            GC_CTRL_RANGE,
+            BedTool(ANNOTATION_FILENAME),
+            BLACKLIST,
+            GC_WINDOW_CACHE,
+            GC_WHITELIST_CACHE
+        )
 
     else:
         blackList_file_name = BLACKLIST
