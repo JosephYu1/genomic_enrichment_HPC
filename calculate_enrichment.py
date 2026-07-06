@@ -60,7 +60,7 @@ arg_parser.add_argument("--GC_blacklist", type=str, default=None,
                         help='custom blacklist file for GC_option (content of file is up to user); default=None')
 
 arg_parser.add_argument("-n", "--num_threads", type=int,
-                        help='number of threads; default=SLURM_CPUS_PER_TASK or 1')
+                        help='number of worker processes; default=auto-detect scheduler CPU allocation or 1')
 
 arg_parser.add_argument("--print_counts_to", type=str, default=None,
                         help="print expected counts to file")
@@ -162,20 +162,6 @@ GC_MAX = args.GC_max
 GC_MIN = args.GC_min
 GC_WINDOW_CACHE = args.GC_window_cache
 GC_WHITELIST_CACHE = args.GC_whitelist_cache
-
-# calculate the number of threads
-if args.num_threads:
-    if args.num_threads >= 40:
-        print("Capping the thread count at 40.")
-        num_threads = 40
-    else:
-        num_threads = args.num_threads
-else:
-    num_threads = int(os.getenv('SLURM_CPUS_PER_TASK', 1))
-
-# if running on slurm, set tmp to runtime dir
-set_tempdir(os.getenv('ACCRE_RUNTIME_DIR', get_tempdir()))
-
 
 ###
 #   functions
@@ -656,30 +642,71 @@ def calculateGC_blackListRegion(
 
     return genomeGC_whitelist_Object, np_annotationGC, whitelist_cache_path
 
+###
+#   multiprocessing worker globals
+###
+
+WORKER_ANNOTATION = None
+WORKER_TEST = None
+
+#
+# initWorkerBedTools
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function initializes BEDTOOL objects once per multiprocessing
+#       worker process. This avoids passing BEDTOOL objects into the
+#       multiprocessing pool and avoids reconstructing them during every
+#       expected iteration.
+#
+# input:
+#       annotation_filename: path to annotation BED file
+#       test_filename:       path to test BED file
+#
+# output:
+#       None
+#
+def initWorkerBedTools(annotation_filename, test_filename):
+    global WORKER_ANNOTATION
+    global WORKER_TEST
+
+    WORKER_ANNOTATION = BedTool(annotation_filename)
+    WORKER_TEST = BedTool(test_filename)
+
 #
 # caclulateExpected_with_GC
 #
 # updated | 2021.7.19
 #           2021.8.15
+#           2026.05.06
 #
 # Description:
 #       This function caclulates the expected intersection results with random
-#       shuffling. The GC option would use the BEDTOOLS object as a whitelist
-#       file, whereas the default option would use the passed in object as a
+#       shuffling. The GC option uses the BEDTOOLS object as a whitelist
+#       file, whereas the default option uses the passed in object as a
 #       blacklist file when running shuffling.
 #
+#       This updated version uses BEDTOOL objects initialized once per
+#       multiprocessing worker process.
+#
 # input:
-#       annotation:    BEDTOOL object with the intersection called on
-#       test:          BEDTOOL object passed into the intersection function
-#       elementwise:   flags for elementwise calculation
-#       hapblock:      flags for haplotype-block overlaps
-#       species:       species for the genome build used
-#       iters:         number of iteration for the calculation
+#       elementwise:          flags for elementwise calculation
+#       hapblock:             flags for haplotype-block overlaps
+#       species:              species for the genome build used
+#       blackList_file_name:  blacklist file or GC-compatible whitelist file
+#       iters:                iteration index
 #
 # output:
-#       returns the calculated overlaps the random shuffling intersection.
+#       returns the calculated overlaps from the random shuffling intersection.
 #
-def calculateExpected_with_GC(annotation, test, elementwise, hapblock, species, blackList_file_name, iters):
+def calculateExpected_with_GC(elementwise, hapblock, species, blackList_file_name, iters):
+
+    global WORKER_ANNOTATION
+    global WORKER_TEST
+
+    annotation = WORKER_ANNOTATION
+    test = WORKER_TEST
 
     exp_sum = 0
     rand_file = None
@@ -688,10 +715,20 @@ def calculateExpected_with_GC(annotation, test, elementwise, hapblock, species, 
 
         if GC_CTRL_OPT:
             print("iteration ", iters, end='\r', file=sys.stderr)
-            rand_file = annotation.shuffle(genome=species, incl=blackList_file_name, chrom=True, noOverlapping=True)
+            rand_file = annotation.shuffle(
+                genome=species,
+                incl=blackList_file_name,
+                chrom=True,
+                noOverlapping=True
+            )
 
         else:
-            rand_file = annotation.shuffle(genome=species, excl=blackList_file_name, chrom=True, noOverlapping=True)
+            rand_file = annotation.shuffle(
+                genome=species,
+                excl=blackList_file_name,
+                chrom=True,
+                noOverlapping=True
+            )
 
         if elementwise:
             exp_sum = rand_file.intersect(test, u=True).count()
@@ -740,11 +777,112 @@ def calculateEmpiricalP(obs, exp_sum_list):
 
     return "%d\t%.3f\t%.3f\t%.3f\t%.3f" % (obs, mu, sigma, fold_change, p_val)
 
+#
+# detectAssignedCPUs
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function detects the number of CPU slots assigned to the
+#       current job by common HPC schedulers. The returned value is used
+#       to set the number of multiprocessing worker processes.
+#
+#       The function checks PBS Pro, PBS/Torque, SGE/UGE, and SLURM
+#       environment variables. If no scheduler variable is found, it
+#       checks Linux CPU affinity. If that is unavailable, it falls back
+#       to os.cpu_count().
+#
+# input:
+#       None
+#
+# output:
+#       return: number of logical CPU slots available to the current job
+#
+def detectAssignedCPUs():
+    scheduler_vars = [
+        "NCPUS",                # PBS Pro
+        "PBS_NP",              # PBS/Torque
+        "NSLOTS",              # SGE/UGE qsub
+        "SLURM_CPUS_PER_TASK", # SLURM
+        "SLURM_CPUS_ON_NODE",  # SLURM fallback
+    ]
+
+    for var in scheduler_vars:
+        value = os.getenv(var)
+
+        if value:
+            try:
+                n = int(value)
+
+                if n > 0:
+                    print(f"Detected {n} CPU slots from ${var}.")
+                    return n
+
+            except ValueError:
+                print(f"Warning: could not parse ${var}={value} as an integer.")
+
+    if hasattr(os, "sched_getaffinity"):
+        n = len(os.sched_getaffinity(0))
+
+        if n > 0:
+            print(f"Detected {n} CPU slots from CPU affinity.")
+            return n
+
+    n = os.cpu_count() or 1
+    print(f"No scheduler CPU variable found; falling back to os.cpu_count()={n}.")
+
+    return n
+
+#
+# getNumThreads
+#
+# updated | 2026.05.06
+#
+# Description:
+#       This function determines the number of multiprocessing worker
+#       processes to use. If the user provides --num_threads, that value
+#       is used. Otherwise, the function detects the number of CPU slots
+#       assigned by the scheduler.
+#
+# input:
+#       requested_threads: user-specified thread count from --num_threads
+#       iterations:        number of expected shuffle iterations
+#
+# output:
+#       return: number of worker processes to use
+#
+def getNumThreads(requested_threads, iterations):
+
+    if requested_threads is not None:
+        num_threads = requested_threads
+        print(f"Using user-specified --num_threads={num_threads}.")
+    else:
+        num_threads = detectAssignedCPUs()
+
+    MAX_WORKERS = 40
+
+    if num_threads > MAX_WORKERS:
+        print(f"Capping worker count at {MAX_WORKERS}.")
+        num_threads = MAX_WORKERS
+
+    if num_threads > iterations:
+        print(f"Reducing worker count to match number of iterations: {iterations}.")
+        num_threads = iterations
+
+    if num_threads < 1:
+        print("Error: number of worker processes must be at least 1.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Using {num_threads} parallel worker processes.")
+
+    return num_threads
 
 ###
 #   main
 ###
 def main(argv):
+
+    num_threads = getNumThreads(args.num_threads, ITERATIONS)
 
     if ( GC_MAX is None and GC_MIN is not None ) or (GC_MAX is not None and GC_MIN is None):
         print("Error: optons --GC_max and --GC_min must be used together")
@@ -786,14 +924,30 @@ def main(argv):
         blackList_file_name = BLACKLIST
 
     print("running calculateExpected_with_GC")
-    pool = Pool(num_threads)
-    partial_calcExp = partial(calculateExpected_with_GC, BedTool(ANNOTATION_FILENAME), BedTool(TEST_FILENAME), ELEMENT, HAPBLOCK, SPECIES, blackList_file_name)
-    exp_sum_list = pool.map(partial_calcExp, [i for i in range(ITERATIONS)])
+
+    partial_calcExp = partial(
+        calculateExpected_with_GC,
+        ELEMENT,
+        HAPBLOCK,
+        SPECIES,
+        blackList_file_name
+    )
+
+    chunksize = max(1, ITERATIONS // (num_threads * 4))
+
+    # Order of expected counts does not matter for empirical p-value calculation.
+    with Pool(
+        processes=num_threads,
+        initializer=initWorkerBedTools,
+        initargs=(ANNOTATION_FILENAME, TEST_FILENAME)
+    ) as pool:
+        exp_sum_list = list(pool.imap_unordered(
+            partial_calcExp,
+            range(ITERATIONS),
+            chunksize=chunksize
+        ))
 
     print("Finish calculateExpected_with_GC")
-    # wait for results to finish before calculating p-value
-    pool.close()
-    pool.join()
 
     # remove iterations that throw bedtools exceptions
     final_exp_sum_list = [x for x in exp_sum_list if x >= 0]
