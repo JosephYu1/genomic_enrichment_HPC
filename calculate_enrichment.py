@@ -765,22 +765,22 @@ def main(argv):
 
     if GC_CTRL_OPT:
 
-    # If the user provides the older --GC_blacklist argument,
-    # treat it as the final GC-compatible whitelist file.
-    if GC_BLACKLIST is not None:
-        blackList_file_name = GC_BLACKLIST
-        print(f"Using GC whitelist from --GC_blacklist: {blackList_file_name}")
+        # If the user provides the older --GC_blacklist argument,
+        # treat it as the final GC-compatible whitelist file.
+        if GC_BLACKLIST is not None:
+            blackList_file_name = GC_BLACKLIST
+            print(f"Using GC whitelist from --GC_blacklist: {blackList_file_name}")
 
-    else:
-        GC_blacklist, np_annotationGC, blackList_file_name = calculateGC_blackListRegion(
-            SPECIES,
-            GC_CTRL_RESOLUTION,
-            GC_CTRL_RANGE,
-            BedTool(ANNOTATION_FILENAME),
-            BLACKLIST,
-            GC_WINDOW_CACHE,
-            GC_WHITELIST_CACHE
-        )
+        else:
+            GC_blacklist, np_annotationGC, blackList_file_name = calculateGC_blackListRegion(
+                SPECIES,
+                GC_CTRL_RESOLUTION,
+                GC_CTRL_RANGE,
+                BedTool(ANNOTATION_FILENAME),
+                BLACKLIST,
+                GC_WINDOW_CACHE,
+                GC_WHITELIST_CACHE
+            )
 
     else:
         blackList_file_name = BLACKLIST
